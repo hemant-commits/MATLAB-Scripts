@@ -1,455 +1,419 @@
-% Capacity_OCV_Simple.m
-% Clean, client-ready plots for 9 Excel logs (30/35/40 °C × 3 files)
-% - Multi-select Excel files (uigetfile)
-% - Sheet autodetect ("Detail", "Statis")
-% - Robust time handling (RelTime resets per step -> cumulative across test)
-% - Capacity% from per-step coulomb counting (Statis capacity if present)
-% - Simple styling:
-%     Color = Temperature (30/35/40 °C)
-%     Style = solid (Discharge), dashed (Charge)
-%     Width = high-rate (bold), low-rate (thin)
-% - Separate OCV-like (~0.03C) plots (Charge/Discharge)
-% - Time-domain plots with side-by-side High-rate vs Low-rate
-% - NO file saving
+% plot_capacity_and_ocv_by_temperature.m
+% Select one or more HPPC/OCV Excel files. The script:
+%   • extracts the "Detail" sheet
+%   • computes SOC for each data set (properly anchored to 0-100%)
+%   • parses the temperature from the filename (e.g. "…_30degC_…", "…_15°C_…")
+%   • shows one combined figure for all capacity-test charge/discharge curves
+%   • shows a second combined figure for all OCV charge/discharge curves
 
-clear; clc; close all;
+clear; clc;
 
-%% Select Excel files
-[files, path] = uigetfile('*.xlsx', 'Select Excel file(s)', 'MultiSelect','on');
-if isequal(files,0), disp('No files selected.'); return; end
-if ischar(files), files = {files}; end
+[fileNames, filePath] = uigetfile( ...
+    {'*.xlsx;*.xls', 'Excel files (*.xlsx, *.xls)'}, ...
+    'Select HPPC/OCV data files', 'MultiSelect', 'on');
 
-%% Constants / Style
-nominalCap   = 15;               % Ah
-I_high_thr   = 5.0;              % A  -> "high-rate"
-lowI_bandA   = [0.35 0.65];      % A  -> ~0.03C windows
-tempsOrder   = [30 35 40];       % legend order
+if isequal(fileNames, 0)
+    disp('No file selected. Exiting.');
+    return;
+end
+if ischar(fileNames), fileNames = {fileNames}; end
 
-% Temperature colors
-tempCol = containers.Map('KeyType','double','ValueType','any');
-tempCol(30) = [0.26 0.54 0.96];  % blue
-tempCol(35) = [1.00 0.58 0.00];  % orange
-tempCol(40) = [0.89 0.10 0.11];  % red
-defaultCol = [0.35 0.35 0.35];
+% C-rate mapping for different temperatures
+cRateMap = containers.Map();
+cRateMap('30') = struct('charge', 0.8, 'discharge', 1.0);
+cRateMap('35') = struct('charge', 0.5, 'discharge', 1.0);
+cRateMap('40') = struct('charge', 0.33, 'discharge', 0.5);
 
-LW_high = 2.2; LW_low = 1.3;     % bold vs thin
+% Containers for combined plotting
+capChargeAll    = struct('label', {}, 'temp', {}, 'cRate', {}, 'soc', {}, 'volt', {});
+capDischargeAll = struct('label', {}, 'temp', {}, 'cRate', {}, 'soc', {}, 'volt', {});
+ocvChargeAll    = struct('label', {}, 'temp', {}, 'soc', {}, 'volt', {});
+ocvDischargeAll = struct('label', {}, 'temp', {}, 'soc', {}, 'volt', {});
+ocvWholeData    = struct('label', {}, 'temp', {}, 'time', {}, 'volt', {});
+capWholeData    = struct('label', {}, 'temp', {}, 'chgCRate', {}, 'dchgCRate', {}, 'time', {}, 'volt', {});
 
-%% Aggregators
-traceDis = {}; traceChg = {};           % Capacity% traces
-ocvChg   = {}; ocvDis  = {};            % ~0.03C Capacity% traces
-fileTab  = struct('D',{},'tempC',{});   % keep D table & temp for time plots
+for f = 1:numel(fileNames)
+    fullFile = fullfile(filePath, fileNames{f});
+    fprintf('\nProcessing %s\n', fullFile);
 
-%% Loop files
-for f = 1:numel(files)
-    fname = files{f};
-    fpath = fullfile(path, fname);
-    fprintf('[%d/%d] %s\n', f, numel(files), fname);
+    % Identify the "Detail" sheet
+    sheets = sheetnames(fullFile);
+    idxDetail = find(contains(lower(sheets), 'detail'), 1, 'first');
+    if isempty(idxDetail)
+        warning('Skipping %s: no sheet containing the word \"Detail\".', fileNames{f});
+        continue;
+    end
+    detailSheet = sheets{idxDetail};
+    fprintf('Using sheet: %s\n', detailSheet);
 
-    % Temperature from filename
-    tok = regexp(fname, '(\d+(?:\.\d+)?)\s*(?:degC|°C|C)', 'tokens', 'once', 'ignorecase');
-    if ~isempty(tok), tempC = str2double(tok{1}); else, tempC = NaN; end
+    T = readtable(fullFile, 'Sheet', detailSheet);
+    varNames = T.Properties.VariableNames;
 
-    % Detect sheets
-    try, [~, sheets] = xlsfinfo(fpath); catch, sheets = {}; end
-    detSheet = 'Detail_96_1_4'; staSheet = 'Statis_96_1_4';
+    % Locate relevant columns (handles MATLAB's sanitized headings)
+    findCol = @(token) varNames{find(contains(varNames, token, 'IgnoreCase', true), 1, 'first')};
+    colState    = findCol('State');
+    colSteps    = findCol('Steps');
+    colVoltage  = findCol('Voltage');
+    colCapacity = findCol('Capacity');
 
-    try
-        rawD = readtable(fpath, 'Sheet', detSheet, 'ReadVariableNames', false);
-    catch
-        cand = sheets(contains(lower(sheets),'detail'));
-        if isempty(cand), error('Detail sheet not found in %s', fname); end
-        detSheet = cand{1};
-        rawD = readtable(fpath, 'Sheet', detSheet, 'ReadVariableNames', false);
+    requiredCols = {colState, colSteps, colVoltage, colCapacity};
+    if any(cellfun(@isempty, requiredCols))
+        warning('Skipping %s: missing expected columns.', fileNames{f});
+        continue;
     end
 
-    rawS = table();
-    try
-        rawS = readtable(fpath, 'Sheet', staSheet, 'ReadVariableNames', false);
-    catch
-        candS = sheets(contains(lower(sheets),'statis'));
-        if ~isempty(candS)
-            staSheet = candS{1};
-            rawS = readtable(fpath, 'Sheet', staSheet, 'ReadVariableNames', false);
-        end
-    end
-
-    % Standardize Detail columns and numeric conversion
-    rawD.Properties.VariableNames = {'RecordNum','State','Jump','Cycle','Steps', ...
-        'Current_A','Voltage_V','Capacity_Ah','Energy_Wh','RelTime_str','Date_str'};
-    D = rawD;
-
-    numCols = {'RecordNum','Jump','Cycle','Steps','Current_A','Voltage_V','Capacity_Ah','Energy_Wh'};
-    for c = 1:numel(numCols)
-        cn = numCols{c};
-        if ~ismember(cn, D.Properties.VariableNames), continue; end
-        v = D.(cn);
-        if iscell(v) || isstring(v), v = str2double(string(v)); end
-        if ~isnumeric(v), v = double(v); end
-        v(~isfinite(v)) = 0;
-        D.(cn) = v;
-    end
-
-    % Keep Cycle 1
-    if ismember('Cycle', D.Properties.VariableNames)
-        D = D(D.Cycle==1, :);
-    end
-    if isempty(D), warning('No Cycle 1 rows in %s', fname); continue; end
-
-    % Parse RelTime -> seconds (robust)
-    relStr = string(D.RelTime_str);
-    try
-        dtmp = duration(relStr, 'InputFormat','hh:mm:ss.SSS');
-    catch
+    % Optional date column (for sorting)
+    dateColIdx = find(contains(varNames, 'Date', 'IgnoreCase', true), 1, 'first');
+    if ~isempty(dateColIdx)
         try
-            dtmp = duration(relStr, 'InputFormat','hh:mm:ss');
+            T.DateTime = datetime(T.(varNames{dateColIdx}), 'InputFormat', 'yyyy-MM-dd HH:mm:ss');
         catch
-            % manual hh:mm:ss(.fff) parsing
-            mm = regexp(relStr, '^\s*(\d+):(\d+):(\d+(?:[.,]\d+)?)', 'tokens', 'once');
-            svec = zeros(size(relStr));
-            for k=1:numel(relStr)
-                if ~isempty(mm{k})
-                    h = str2double(mm{k}{1});
-                    m = str2double(mm{k}{2});
-                    s = str2double(strrep(mm{k}{3},',','.'));
-                    svec(k) = h*3600 + m*60 + s;
+            % fall back to MATLAB default parsing
+            T.DateTime = datetime(T.(varNames{dateColIdx}));
+        end
+    else
+        T.DateTime = (0:height(T)-1).';
+    end
+    T = sortrows(T, 'DateTime');
+
+    State    = string(T.(colState));
+    Steps    = T.(colSteps);
+    Voltage  = T.(colVoltage);
+    Capacity = T.(colCapacity);
+    DateTime = T.DateTime;  % Keep datetime for time-based plotting
+
+    % Determine reference capacity (largest excursion among main steps)
+    refIdx = ismember(Steps, [3 5 9 11]);
+    refCapacityAh = max(Capacity(refIdx));
+    if refCapacityAh <= 0 || isnan(refCapacityAh)
+        warning('Skipping %s: reference capacity <= 0.', fileNames{f});
+        continue;
+    end
+
+    % Build SOC profile across steps with proper 0-100% anchoring
+    soc = nan(height(T), 1);
+    uniqueSteps = unique(Steps, 'stable');
+
+    for k = 1:numel(uniqueSteps)
+        stepVal = uniqueSteps(k);
+        idxStep = Steps == stepVal;
+        stateName = State(find(idxStep, 1, 'first'));
+
+        if contains(stateName, 'DChg', 'IgnoreCase', true)
+            % Discharge: SOC decreases from 100% to 0%
+            deltaCap = Capacity(idxStep);
+            % Start from 100% and subtract capacity
+            soc(idxStep) = 100 - (deltaCap ./ refCapacityAh) * 100;
+            
+        elseif contains(stateName, 'Chg', 'IgnoreCase', true)
+            % Charge: SOC increases from 0% to 100%
+            deltaCap = Capacity(idxStep);
+            % Start from 0% and add capacity
+            soc(idxStep) = (deltaCap ./ refCapacityAh) * 100;
+            
+        else
+            % Rest or other state: maintain constant SOC
+            if k > 1
+                % Use the last SOC value from previous step
+                prevStepIdx = Steps == uniqueSteps(k-1);
+                lastSOC = soc(find(prevStepIdx, 1, 'last'));
+                if ~isnan(lastSOC)
+                    soc(idxStep) = lastSOC;
+                else
+                    soc(idxStep) = 50; % default fallback
                 end
+            else
+                soc(idxStep) = 50; % default for first step if it's a rest
             end
-            dtmp = seconds(svec);
+        end
+
+        % Clamp SOC to [0, 100]
+        soc(idxStep) = max(min(soc(idxStep), 100), 0);
+    end
+
+    % Pull temperature from filename (e.g., "…_30degC…", "…_15°C…")
+    baseName = erase(fileNames{f}, {'.xlsx', '.xls'});
+    lowerName = lower(baseName);
+    tempTok = regexp(lowerName, '(-?\d+(\.\d+)?)\s*(deg|°)?c', 'tokens', 'once');
+    if isempty(tempTok)
+        tempLabel = 'Unknown';
+        tempNum = 'Unknown';
+    else
+        tempLabel = tempTok{1};
+        tempNum = tempLabel;
+        if tempLabel(1) ~= '-'  % make sure there's no leading plus sign
+            tempLabel = strtrim(tempLabel);
         end
     end
-    D.Time_s_rel = seconds(dtmp);
-    D.Time_s_rel(~isfinite(D.Time_s_rel)) = 0;
-
-    % Build cumulative time across steps (RelTime resets each step)
-    steps = double(D.Steps);
-    rel   = D.Time_s_rel;
-    tCum  = zeros(size(rel));
-    if ~isempty(rel)
-        [uSteps,~,ix] = unique(steps,'stable');
-        stepStart = accumarray(ix, rel, [], @(v) v(1));
-        stepEnd   = accumarray(ix, rel, [], @(v) v(end));
-        stepDur   = max(stepEnd - stepStart, 0);              % seconds
-        stepOff   = [0; cumsum(stepDur(1:end-1))];            % seconds per unique step
-        offByRow  = stepOff(ix);
-        tCum      = offByRow + (rel - stepStart(ix));
+    
+    % Get C-rates for this temperature
+    if isKey(cRateMap, tempNum)
+        cRates = cRateMap(tempNum);
+        chgCRate = cRates.charge;
+        dchgCRate = cRates.discharge;
+    else
+        chgCRate = NaN;
+        dchgCRate = NaN;
     end
-    D.Time_s_cum = tCum;  % seconds
+    
+    label = sprintf('%s°C', tempLabel);
 
-    % Build step capacity map from Statis if available
-    stepCaps = containers.Map('KeyType','double','ValueType','double');
-    if ~isempty(rawS) && width(rawS) >= 19
-        rawS.Properties.VariableNames = {'Channel','Cycle','Steps','OriginalStep','State', ...
-            'OnsetV','EndV','StartI','EndI','Capacity_Ah','ContTime','RelTime','Date', ...
-            'NetDChgCap','ChgCap','DChgCap','NetDChgEnergy','ChgEnergy','DChgEnergy'};
-        if iscell(rawS.Cycle), rawS.Cycle = str2double(rawS.Cycle); end
-        if iscell(rawS.Steps), rawS.Steps = str2double(rawS.Steps); end
-        S1 = rawS(rawS.Cycle==1, :);
-        caps = S1.Capacity_Ah; if iscell(caps), caps = str2double(caps); end
-        for j = 1:height(S1)
-            sNum = S1.Steps(j);
-            if ~isnan(sNum) && ~isnan(caps(j)), stepCaps(sNum) = abs(caps(j)); end
-        end
+    % Helper to snag step data
+    grab = @(stepList) struct( ...
+        'soc',  soc(ismember(Steps, stepList)), ...
+        'volt', Voltage(ismember(Steps, stepList)));
+    
+    % Helper for time-based data
+    grabTime = @(stepList) struct( ...
+        'time', DateTime(ismember(Steps, stepList)), ...
+        'volt', Voltage(ismember(Steps, stepList)));
+
+    capCharge    = grab(3);
+    capDischarge = grab(5);
+    ocvCharge    = grab(9);
+    ocvDischarge = grab(11);
+    
+    % Get all OCV data (steps 9 and 11) for voltage vs time plot
+    ocvWhole = grabTime([9 11]);
+    % Get all Capacity data (steps 3 and 5) for voltage vs time plot
+    capWhole = grabTime([3 5]);
+
+    capChargeAll(end+1)    = struct('label', label, 'temp', str2double(tempNum), ...
+        'cRate', chgCRate, 'soc', capCharge.soc, 'volt', capCharge.volt);
+    capDischargeAll(end+1) = struct('label', label, 'temp', str2double(tempNum), ...
+        'cRate', dchgCRate, 'soc', capDischarge.soc, 'volt', capDischarge.volt);
+    ocvChargeAll(end+1)    = struct('label', label, 'temp', str2double(tempNum), ...
+        'soc', ocvCharge.soc, 'volt', ocvCharge.volt);
+    ocvDischargeAll(end+1) = struct('label', label, 'temp', str2double(tempNum), ...
+        'soc', ocvDischarge.soc, 'volt', ocvDischarge.volt);
+    ocvWholeData(end+1)    = struct('label', label, 'temp', str2double(tempNum), ...
+        'time', ocvWhole.time, 'volt', ocvWhole.volt);
+    capWholeData(end+1)    = struct('label', label, 'temp', str2double(tempNum), ...
+        'chgCRate', chgCRate, 'dchgCRate', dchgCRate, 'time', capWhole.time, 'volt', capWhole.volt);
+end
+
+if isempty(capChargeAll)
+    error('No valid files processed—nothing to plot.');
+end
+
+%% Combined capacity figure
+figure('Name', 'Capacity Test - Voltage vs SOC at Different Temperatures', ...
+    'Position', [100 100 1400 600], 'Color', 'w');
+
+% Define professional color scheme - one color per temperature
+colorMap = containers.Map();
+colorMap('30') = [0.0000 0.4470 0.7410];  % Blue
+colorMap('35') = [0.8500 0.3250 0.0980];  % Red-orange
+colorMap('40') = [0.4660 0.6740 0.1880];  % Green
+colorMap('25') = [0.9290 0.6940 0.1250];  % Yellow
+colorMap('20') = [0.4940 0.1840 0.5560];  % Purple
+colorMap('45') = [0.3010 0.7450 0.9330];  % Cyan
+% Default color for unknown temperatures
+defaultColor = [0.5 0.5 0.5];  % Gray
+
+% Sort by temperature for consistent plotting
+[~, sortIdx] = sort([capChargeAll.temp]);
+capChargeAll = capChargeAll(sortIdx);
+[~, sortIdx] = sort([capDischargeAll.temp]);
+capDischargeAll = capDischargeAll(sortIdx);
+
+% Charge subplot
+subplot(1,2,1); hold on; grid on; box on;
+for k = 1:numel(capChargeAll)
+    tempStr = num2str(capChargeAll(k).temp);
+    if isKey(colorMap, tempStr)
+        plotColor = colorMap(tempStr);
+    else
+        plotColor = defaultColor;
     end
-
-    % Build Capacity% traces per step (Discharge / Charge)
-    st = string(D.State);
-    isD = contains(st,'DChg');
-    isC = contains(st,'Chg') & ~isD;
-    Iabs = abs(D.Current_A);
-
-    % Discharge steps
-    uD = unique(D.Steps(isD));
-    for k = 1:numel(uD)
-        idx = isD & (D.Steps == uD(k));
-        if ~any(idx), continue; end
-        dt_h_rel = [0; diff(D.Time_s_rel(idx))]/3600;
-        q_step   = cumsum(abs(D.Current_A(idx)).*dt_h_rel);   % Ah
-        if ~isempty(stepCaps) && isKey(stepCaps, uD(k)), q_tot = stepCaps(uD(k));
-        else, q_tot = max(q_step); end
-        if ~(q_tot > 0), q_tot = 1; end
-        tr.tempC  = tempC;
-        tr.capPct = (q_step / q_tot) * 100;
-        tr.V      = D.Voltage_V(idx);
-        tr.isHigh = any(Iabs(idx) > I_high_thr);
-        traceDis{end+1} = tr; %#ok<SAGROW>
+    
+    if ~isnan(capChargeAll(k).cRate)
+        legendStr = sprintf('%s (%.2gC)', capChargeAll(k).label, capChargeAll(k).cRate);
+    else
+        legendStr = capChargeAll(k).label;
     end
+    plot(capChargeAll(k).soc, capChargeAll(k).volt, 'LineWidth', 2, ...
+        'Color', plotColor, 'DisplayName', legendStr);
+end
+xlabel('State of Charge (%)', 'FontSize', 12, 'FontWeight', 'bold');
+ylabel('Voltage (V)', 'FontSize', 12, 'FontWeight', 'bold');
+title('Charge Profile', 'FontSize', 14, 'FontWeight', 'bold');
+legend('Location', 'southeast', 'FontSize', 10);
+xlim([0 100]);
+set(gca, 'FontSize', 11, 'LineWidth', 1.5);
 
-    % Charge steps
-    uC = unique(D.Steps(isC));
-    for k = 1:numel(uC)
-        idx = isC & (D.Steps == uC(k));
-        if ~any(idx), continue; end
-        dt_h_rel = [0; diff(D.Time_s_rel(idx))]/3600;
-        q_step   = cumsum(abs(D.Current_A(idx)).*dt_h_rel);   % Ah
-        if ~isempty(stepCaps) && isKey(stepCaps, uC(k)), q_tot = stepCaps(uC(k));
-        else, q_tot = max(q_step); end
-        if ~(q_tot > 0), q_tot = 1; end
-        tr.tempC  = tempC;
-        tr.capPct = (q_step / q_tot) * 100;
-        tr.V      = D.Voltage_V(idx);
-        tr.isHigh = any(Iabs(idx) > I_high_thr);
-        traceChg{end+1} = tr; %#ok<SAGROW>
+% Discharge subplot
+subplot(1,2,2); hold on; grid on; box on;
+for k = 1:numel(capDischargeAll)
+    tempStr = num2str(capDischargeAll(k).temp);
+    if isKey(colorMap, tempStr)
+        plotColor = colorMap(tempStr);
+    else
+        plotColor = defaultColor;
     end
-
-    % OCV-like (~0.03C) traces (Discharge & Charge)
-    lowI = Iabs >= lowI_bandA(1) & Iabs <= lowI_bandA(2);
-
-    uDlo = unique(D.Steps(isD & lowI));
-    for k = 1:numel(uDlo)
-        idx = isD & lowI & (D.Steps == uDlo(k));
-        if ~any(idx), continue; end
-        dt_h_rel = [0; diff(D.Time_s_rel(idx))]/3600;
-        q_step   = cumsum(abs(D.Current_A(idx)).*dt_h_rel);
-        if ~isempty(stepCaps) && isKey(stepCaps, uDlo(k)), q_tot = stepCaps(uDlo(k));
-        else, q_tot = max(q_step); end
-        if ~(q_tot > 0), q_tot = 1; end
-        tr.tempC  = tempC;
-        tr.capPct = (q_step / q_tot) * 100;
-        tr.V      = D.Voltage_V(idx);
-        ocvDis{end+1} = tr; %#ok<SAGROW>
+    
+    if ~isnan(capDischargeAll(k).cRate)
+        legendStr = sprintf('%s (%.2gC)', capDischargeAll(k).label, capDischargeAll(k).cRate);
+    else
+        legendStr = capDischargeAll(k).label;
     end
+    plot(capDischargeAll(k).soc, capDischargeAll(k).volt, 'LineWidth', 2, ...
+        'Color', plotColor, 'DisplayName', legendStr);
+end
+set(gca, 'XDir', 'reverse');
+xlabel('State of Charge (%)', 'FontSize', 12, 'FontWeight', 'bold');
+ylabel('Voltage (V)', 'FontSize', 12, 'FontWeight', 'bold');
+title('Discharge Profile', 'FontSize', 14, 'FontWeight', 'bold');
+legend('Location', 'southwest', 'FontSize', 10);
+xlim([0 100]);
+set(gca, 'FontSize', 11, 'LineWidth', 1.5);
 
-    uClo = unique(D.Steps(isC & lowI));
-    for k = 1:numel(uClo)
-        idx = isC & lowI & (D.Steps == uClo(k));
-        if ~any(idx), continue; end
-        dt_h_rel = [0; diff(D.Time_s_rel(idx))]/3600;
-        q_step   = cumsum(abs(D.Current_A(idx)).*dt_h_rel);
-        if ~isempty(stepCaps) && isKey(stepCaps, uClo(k)), q_tot = stepCaps(uClo(k));
-        else, q_tot = max(q_step); end
-        if ~(q_tot > 0), q_tot = 1; end
-        tr.tempC  = tempC;
-        tr.capPct = (q_step / q_tot) * 100;
-        tr.V      = D.Voltage_V(idx);
-        ocvChg{end+1} = tr; %#ok<SAGROW>
+% Add main title
+sgtitle('Capacity Test: Voltage vs SOC at Different Temperatures and C-Rates', ...
+    'FontSize', 16, 'FontWeight', 'bold');
+
+%% Combined OCV figure
+% OCV C-rate (C/30)
+ocvCRate = 1/30; % C/30 rate
+
+figure('Name', 'OCV Test - Voltage vs SOC at Different Temperatures', ...
+    'Position', [150 150 1400 600], 'Color', 'w');
+
+% Sort by temperature for consistent plotting
+[~, sortIdx] = sort([ocvChargeAll.temp]);
+ocvChargeAll = ocvChargeAll(sortIdx);
+[~, sortIdx] = sort([ocvDischargeAll.temp]);
+ocvDischargeAll = ocvDischargeAll(sortIdx);
+
+% Charge subplot
+subplot(1,2,1); hold on; grid on; box on;
+for k = 1:numel(ocvChargeAll)
+    tempStr = num2str(ocvChargeAll(k).temp);
+    if isKey(colorMap, tempStr)
+        plotColor = colorMap(tempStr);
+    else
+        plotColor = defaultColor;
     end
-
-    % Keep table for time-domain plots
-    fileTab(end+1).D = D; %#ok<SAGROW>
-    fileTab(end).tempC = tempC;
+    
+    plot(ocvChargeAll(k).soc, ocvChargeAll(k).volt, 'LineWidth', 2, ...
+        'Color', plotColor, 'DisplayName', ocvChargeAll(k).label);
 end
+xlabel('State of Charge (%)', 'FontSize', 12, 'FontWeight', 'bold');
+ylabel('Voltage (V)', 'FontSize', 12, 'FontWeight', 'bold');
+title('OCV Charge Profile', 'FontSize', 14, 'FontWeight', 'bold');
+legend('Location', 'southeast', 'FontSize', 10);
+xlim([0 100]);
+set(gca, 'FontSize', 11, 'LineWidth', 1.5);
 
-%% ---------- FIGURES (simple, consistent) ----------
-
-% Helper inline pick color
-pickCol = @(t) ( ~isnan(t) && isKey(tempCol,t) ) .* tempCol(t) + ...
-               ( isnan(t) || ~isKey(tempCol,t) ) .* defaultCol;
-
-%% 1) DISCHARGE: Voltage vs Capacity%
-figure('Name','Discharge: Voltage vs Capacity%','Color','w','Position',[60 80 1250 720]);
-ax = axes; hold on; grid on; grid minor; box on;
-for i = 1:numel(traceDis)
-    tr = traceDis{i};
-    c  = pickCol(tr.tempC);
-    lw = LW_high; if ~tr.isHigh, lw = LW_low; end
-    plot(tr.capPct, tr.V, '-', 'Color', c, 'LineWidth', lw);
-end
-xlabel('Capacity (%)'); ylabel('Voltage (V)');
-title('Discharge: Voltage vs Capacity (%)');
-subtitle('Color = Temp (30/35/40 °C) | Solid = Discharge | Width: highC (bold), lowC (thin)');
-xlim([0 100]); ylim([1.8 3.7]);
-
-% Legend proxies: per Temp, high/low
-hLeg = []; labLeg = {};
-for t = tempsOrder
-    hasT = any(arrayfun(@(k) isequal(traceDis{k}.tempC,t), 1:numel(traceDis)));
-    if ~hasT, continue; end
-    c = tempCol(t);
-    % highC
-    hasHigh = any(arrayfun(@(k) isequal(traceDis{k}.tempC,t) && traceDis{k}.isHigh, 1:numel(traceDis)));
-    if hasHigh
-        hLeg(end+1) = plot(nan,nan,'-','Color',c,'LineWidth',LW_high); %#ok<SAGROW>
-        labLeg{end+1} = sprintf('%g^\\circC — highC (DChg)', t);       %#ok<SAGROW>
+% Discharge subplot
+subplot(1,2,2); hold on; grid on; box on;
+for k = 1:numel(ocvDischargeAll)
+    tempStr = num2str(ocvDischargeAll(k).temp);
+    if isKey(colorMap, tempStr)
+        plotColor = colorMap(tempStr);
+    else
+        plotColor = defaultColor;
     end
-    % lowC
-    hasLow = any(arrayfun(@(k) isequal(traceDis{k}.tempC,t) && ~traceDis{k}.isHigh, 1:numel(traceDis)));
-    if hasLow
-        hLeg(end+1) = plot(nan,nan,'-','Color',c,'LineWidth',LW_low);  %#ok<SAGROW>
-        labLeg{end+1} = sprintf('%g^\\circC — lowC (DChg)', t);        %#ok<SAGROW>
-    end
+    
+    plot(ocvDischargeAll(k).soc, ocvDischargeAll(k).volt, 'LineWidth', 2, ...
+        'Color', plotColor, 'DisplayName', ocvDischargeAll(k).label);
 end
-legend(hLeg, labLeg, 'Location','eastoutside');
+set(gca, 'XDir', 'reverse');
+xlabel('State of Charge (%)', 'FontSize', 12, 'FontWeight', 'bold');
+ylabel('Voltage (V)', 'FontSize', 12, 'FontWeight', 'bold');
+title('OCV Discharge Profile', 'FontSize', 14, 'FontWeight', 'bold');
+legend('Location', 'southwest', 'FontSize', 10);
+xlim([0 100]);
+set(gca, 'FontSize', 11, 'LineWidth', 1.5);
 
-%% 2) CHARGE: Voltage vs Capacity%
-figure('Name','Charge: Voltage vs Capacity%','Color','w','Position',[60 80 1250 720]);
-ax = axes; hold on; grid on; grid minor; box on;
-for i = 1:numel(traceChg)
-    tr = traceChg{i};
-    c  = pickCol(tr.tempC);
-    lw = LW_high; if ~tr.isHigh, lw = LW_low; end
-    plot(tr.capPct, tr.V, '--', 'Color', c, 'LineWidth', lw);
-end
-xlabel('Capacity (%)'); ylabel('Voltage (V)');
-title('Charge: Voltage vs Capacity (%)');
-subtitle('Color = Temp (30/35/40 °C) | Dashed = Charge | Width: highC (bold), lowC (thin)');
-xlim([0 100]); ylim([1.8 3.7]);
+% Add main title with C-rate
+sgtitle(sprintf('OCV Test at C/30 (%.4gC): Voltage vs SOC at Different Temperatures', ocvCRate), ...
+    'FontSize', 16, 'FontWeight', 'bold');
 
-% Legend proxies: per Temp, high/low
-hLeg = []; labLeg = {};
-for t = tempsOrder
-    hasT = any(arrayfun(@(k) isequal(traceChg{k}.tempC,t), 1:numel(traceChg)));
-    if ~hasT, continue; end
-    c = tempCol(t);
-    % highC
-    hasHigh = any(arrayfun(@(k) isequal(traceChg{k}.tempC,t) && traceChg{k}.isHigh, 1:numel(traceChg)));
-    if hasHigh
-        hLeg(end+1) = plot(nan,nan,'--','Color',c,'LineWidth',LW_high); %#ok<SAGROW>
-        labLeg{end+1} = sprintf('%g^\\circC — highC (Chg)', t);         %#ok<SAGROW>
-    end
-    % lowC
-    hasLow = any(arrayfun(@(k) isequal(traceChg{k}.tempC,t) && ~traceChg{k}.isHigh, 1:numel(traceChg)));
-    if hasLow
-        hLeg(end+1) = plot(nan,nan,'--','Color',c,'LineWidth',LW_low);  %#ok<SAGROW>
-        labLeg{end+1} = sprintf('%g^\\circC — lowC (Chg)', t);          %#ok<SAGROW>
-    end
-end
-legend(hLeg, labLeg, 'Location','eastoutside');
+%% OCV Voltage vs Time figure
+figure('Name', 'OCV Test - Voltage vs Time', ...
+    'Position', [200 200 1200 700], 'Color', 'w');
 
-%% 3) OCV-like (~0.03C) CHARGE
-figure('Name','OCV-like Charge (~0.03C)','Color','w','Position',[60 80 1200 700]);
-axes; hold on; grid on; grid minor; box on;
-for i = 1:numel(ocvChg)
-    tr = ocvChg{i};
-    c  = pickCol(tr.tempC);
-    plot(tr.capPct, tr.V, '--', 'Color', c, 'LineWidth', 2.0);
-end
-xlabel('Capacity (%)'); ylabel('Voltage (V)');
-title('OCV-like Charge (~0.03C)'); subtitle('Color = Temp (30/35/40 °C)');
-xlim([0 100]); ylim([1.8 3.7]);
-% legend: temps only
-hLeg = []; labLeg = {};
-for t = tempsOrder
-    if any(arrayfun(@(k) isequal(ocvChg{k}.tempC,t), 1:numel(ocvChg)))
-        hLeg(end+1) = plot(nan,nan,'--','Color',tempCol(t),'LineWidth',2); %#ok<SAGROW>
-        labLeg{end+1} = sprintf('%g^\\circC', t);                           %#ok<SAGROW>
-    end
-end
-legend(hLeg, labLeg, 'Location','eastoutside');
+% Sort by temperature for consistent plotting
+[~, sortIdx] = sort([ocvWholeData.temp]);
+ocvWholeData = ocvWholeData(sortIdx);
 
-%% 4) OCV-like (~0.03C) DISCHARGE
-figure('Name','OCV-like Discharge (~0.03C)','Color','w','Position',[60 80 1200 700]);
-axes; hold on; grid on; grid minor; box on;
-for i = 1:numel(ocvDis)
-    tr = ocvDis{i};
-    c  = pickCol(tr.tempC);
-    plot(tr.capPct, tr.V, '-', 'Color', c, 'LineWidth', 2.0);
-end
-xlabel('Capacity (%)'); ylabel('Voltage (V)');
-title('OCV-like Discharge (~0.03C)'); subtitle('Color = Temp (30/35/40 °C)');
-xlim([0 100]); ylim([1.8 3.7]);
-% legend: temps only
-hLeg = []; labLeg = {};
-for t = tempsOrder
-    if any(arrayfun(@(k) isequal(ocvDis{k}.tempC,t), 1:numel(ocvDis)))
-        hLeg(end+1) = plot(nan,nan,'-','Color',tempCol(t),'LineWidth',2); %#ok<SAGROW>
-        labLeg{end+1} = sprintf('%g^\\circC', t);                          %#ok<SAGROW>
-    end
-end
-legend(hLeg, labLeg, 'Location','eastoutside');
+hold on; grid on; box on;
 
-%% 5) Voltage vs Time — DISCHARGE (High-rate | Low-rate)
-figure('Name','Voltage vs Time — Discharge','Color','w','Position',[60 80 1400 700]);
-for p = 1:2
-    subplot(1,2,p); hold on; grid on; grid minor; box on;
-    for f = 1:numel(fileTab)
-        D = fileTab(f).D; tC = fileTab(f).tempC;
-        st = string(D.State); isD = contains(st,'DChg');
-        if p==1, idx = isD & (abs(D.Current_A) > I_high_thr); ttl = 'Discharge — High-rate only';
-        else,    idx = isD & (abs(D.Current_A) >= lowI_bandA(1) & abs(D.Current_A) <= lowI_bandA(2));
-                 ttl = 'Discharge — Low-rate (~0.03C) only';
-        end
-        if any(idx)
-            c = pickCol(tC);
-            plot(D.Time_s_cum(idx)/3600, D.Voltage_V(idx), '-', 'Color', c, 'LineWidth', 1.8);
-        end
+for k = 1:numel(ocvWholeData)
+    tempStr = num2str(ocvWholeData(k).temp);
+    if isKey(colorMap, tempStr)
+        plotColor = colorMap(tempStr);
+    else
+        plotColor = defaultColor;
     end
-    xlabel('Time (h)'); ylabel('Voltage (V)'); ylim([1.8 3.7]); title(ttl);
-end
-% legend (temps only)
-axes('Position',[0 0 1 1],'Visible','off'); hold on;
-hLeg = []; labLeg = {};
-for t = tempsOrder
-    hLeg(end+1) = plot(nan,nan,'-','Color',tempCol(t),'LineWidth',2); %#ok<AGROW>
-    labLeg{end+1} = sprintf('%g^\\circC', t);                           %#ok<AGROW>
-end
-legend(hLeg, labLeg, 'Position',[0.90 0.35 0.08 0.25]);  % right edge
-
-%% 6) Voltage vs Time — CHARGE (High-rate | Low-rate)
-figure('Name','Voltage vs Time — Charge','Color','w','Position',[60 80 1400 700]);
-for p = 1:2
-    subplot(1,2,p); hold on; grid on; grid minor; box on;
-    for f = 1:numel(fileTab)
-        D = fileTab(f).D; tC = fileTab(f).tempC;
-        st = string(D.State); isC = contains(st,'Chg') & ~contains(st,'DChg');
-        if p==1, idx = isC & (abs(D.Current_A) > I_high_thr); ttl = 'Charge — High-rate only';
-        else,    idx = isC & (abs(D.Current_A) >= lowI_bandA(1) & abs(D.Current_A) <= lowI_bandA(2));
-                 ttl = 'Charge — Low-rate (~0.03C) only';
-        end
-        if any(idx)
-            c = pickCol(tC);
-            plot(D.Time_s_cum(idx)/3600, D.Voltage_V(idx), '--', 'Color', c, 'LineWidth', 1.8);
-        end
+    
+    % Convert time to relative time in hours from start of OCV test
+    timeData = ocvWholeData(k).time;
+    if ~isempty(timeData) && isdatetime(timeData)
+        relativeTime = hours(timeData - timeData(1));
+    else
+        relativeTime = (1:length(ocvWholeData(k).volt))';
     end
-    xlabel('Time (h)'); ylabel('Voltage (V)'); ylim([1.8 3.7]); title(ttl);
+    
+    plot(relativeTime, ocvWholeData(k).volt, 'LineWidth', 2, ...
+        'Color', plotColor, 'DisplayName', ocvWholeData(k).label);
 end
-axes('Position',[0 0 1 1],'Visible','off'); hold on;
-hLeg = []; labLeg = {};
-for t = tempsOrder
-    hLeg(end+1) = plot(nan,nan,'--','Color',tempCol(t),'LineWidth',2); %#ok<AGROW>
-    labLeg{end+1} = sprintf('%g^\\circC', t);                            %#ok<AGROW>
-end
-legend(hLeg, labLeg, 'Position',[0.90 0.35 0.08 0.25]);
 
-%% 7) Current vs Time — DISCHARGE (High-rate | Low-rate)
-figure('Name','Current vs Time — Discharge','Color','w','Position',[60 80 1400 700]);
-for p = 1:2
-    subplot(1,2,p); hold on; grid on; grid minor; box on;
-    for f = 1:numel(fileTab)
-        D = fileTab(f).D; tC = fileTab(f).tempC;
-        st = string(D.State); isD = contains(st,'DChg');
-        if p==1, idx = isD & (abs(D.Current_A) > I_high_thr); ttl = 'Discharge — High-rate only'; yl = [-16 2];
-        else,    idx = isD & (abs(D.Current_A) >= lowI_bandA(1) & abs(D.Current_A) <= lowI_bandA(2));
-                 ttl = 'Discharge — Low-rate (~0.03C) only'; yl = [-1 1];
-        end
-        if any(idx)
-            c = pickCol(tC);
-            plot(D.Time_s_cum(idx)/3600, D.Current_A(idx), '-', 'Color', c, 'LineWidth', 1.8);
-        end
+xlabel('Time (hours)', 'FontSize', 12, 'FontWeight', 'bold');
+ylabel('Voltage (V)', 'FontSize', 12, 'FontWeight', 'bold');
+title('OCV Test: Voltage vs Time', 'FontSize', 14, 'FontWeight', 'bold');
+legend('Location', 'best', 'FontSize', 10);
+set(gca, 'FontSize', 11, 'LineWidth', 1.5);
+
+% Add subtitle with C-rate info
+subtitle(sprintf('C-Rate: C/30 (%.4gC)', ocvCRate), 'FontSize', 12);
+
+%% Capacity Test Voltage vs Time figure
+figure('Name', 'Capacity Test - Voltage vs Time', ...
+    'Position', [250 250 1200 700], 'Color', 'w');
+
+% Sort by temperature for consistent plotting
+[~, sortIdx] = sort([capWholeData.temp]);
+capWholeData = capWholeData(sortIdx);
+
+hold on; grid on; box on;
+
+for k = 1:numel(capWholeData)
+    tempStr = num2str(capWholeData(k).temp);
+    if isKey(colorMap, tempStr)
+        plotColor = colorMap(tempStr);
+    else
+        plotColor = defaultColor;
     end
-    xlabel('Time (h)'); ylabel('Current (A)'); ylim(yl); title(ttl);
-end
-axes('Position',[0 0 1 1],'Visible','off'); hold on;
-hLeg = []; labLeg = {};
-for t = tempsOrder
-    hLeg(end+1) = plot(nan,nan,'-','Color',tempCol(t),'LineWidth',2); %#ok<AGROW>
-    labLeg{end+1} = sprintf('%g^\\circC', t);                           %#ok<AGROW>
-end
-legend(hLeg, labLeg, 'Position',[0.90 0.35 0.08 0.25]);
-
-%% 8) Current vs Time — CHARGE (High-rate | Low-rate)
-figure('Name','Current vs Time — Charge','Color','w','Position',[60 80 1400 700]);
-for p = 1:2
-    subplot(1,2,p); hold on; grid on; grid minor; box on;
-    for f = 1:numel(fileTab)
-        D = fileTab(f).D; tC = fileTab(f).tempC;
-        st = string(D.State); isC = contains(st,'Chg') & ~contains(st,'DChg');
-        if p==1, idx = isC & (abs(D.Current_A) > I_high_thr); ttl = 'Charge — High-rate only'; yl = [0 16];
-        else,    idx = isC & (abs(D.Current_A) >= lowI_bandA(1) & abs(D.Current_A) <= lowI_bandA(2));
-                 ttl = 'Charge — Low-rate (~0.03C) only'; yl = [0 1];
-        end
-        if any(idx)
-            c = pickCol(tC);
-            plot(D.Time_s_cum(idx)/3600, D.Current_A(idx), '--', 'Color', c, 'LineWidth', 1.8);
-        end
+    
+    % Convert time to relative time in hours from start of capacity test
+    timeData = capWholeData(k).time;
+    if ~isempty(timeData) && isdatetime(timeData)
+        relativeTime = hours(timeData - timeData(1));
+    else
+        relativeTime = (1:length(capWholeData(k).volt))';
     end
-    xlabel('Time (h)'); ylabel('Current (A)'); ylim(yl); title(ttl);
+    
+    % Create legend with both charge and discharge C-rates
+    if ~isnan(capWholeData(k).chgCRate) && ~isnan(capWholeData(k).dchgCRate)
+        legendStr = sprintf('%s (Chg: %.2gC, DChg: %.2gC)', ...
+            capWholeData(k).label, capWholeData(k).chgCRate, capWholeData(k).dchgCRate);
+    else
+        legendStr = capWholeData(k).label;
+    end
+    
+    plot(relativeTime, capWholeData(k).volt, 'LineWidth', 2, ...
+        'Color', plotColor, 'DisplayName', legendStr);
 end
-axes('Position',[0 0 1 1],'Visible','off'); hold on;
-hLeg = []; labLeg = {};
-for t = tempsOrder
-    hLeg(end+1) = plot(nan,nan,'--','Color',tempCol(t),'LineWidth',2); %#ok<AGROW>
-    labLeg{end+1} = sprintf('%g^\\circC', t);                            %#ok<AGROW>
-end
-legend(hLeg, labLeg, 'Position',[0.90 0.35 0.08 0.25]);
 
-disp('All figures generated.');
+xlabel('Time (hours)', 'FontSize', 12, 'FontWeight', 'bold');
+ylabel('Voltage (V)', 'FontSize', 12, 'FontWeight', 'bold');
+title('Capacity Test: Voltage vs Time', 'FontSize', 14, 'FontWeight', 'bold');
+legend('Location', 'best', 'FontSize', 10);
+set(gca, 'FontSize', 11, 'LineWidth', 1.5);
+
+% Add subtitle
+subtitle('Complete Charge and Discharge Cycles at Different Temperatures', 'FontSize', 12);
+
+fprintf('\nPlotted combined capacity and OCV curves for %d data set(s).\n', numel(capChargeAll));
